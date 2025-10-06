@@ -1,49 +1,53 @@
-const CMIService = require('../services/CMIService');
 const PaymentTransaction = require('../models/PaymentTransaction');
+const CMIService = require('../services/CMIService');
 const { triggerSuccessHook, triggerFailHook } = require('../hooks/onPaymentSuccess');
 
-class PaymentController {
-  static async pay(req, res) {
-    try {
-      const { orderId, amount, userId } = req.body;
-      const result = await CMIService.initiatePayment(orderId, amount, userId);
+exports.pay = async (req, res) => {
+  try {
+    const { userId, orderId, amount, relatedParties, webhookUrl } = req.body;
 
-      // Save transaction encrypted
-      await PaymentTransaction.create({
-        orderId,
-        userId,
-        amount,
-        status: 'pending',
-        encryptedData: JSON.stringify(result)
-      });
+    const encryptedData = await CMIService.encryptPaymentData({ userId, orderId, amount });
 
-      res.json({ success: true, paymentUrl: result.paymentUrl });
-    } catch (err) {
-      res.status(500).json({ success: false, message: err.message });
-    }
+    const transaction = await PaymentTransaction.create({
+      userId,
+      orderId,
+      amount,
+      encryptedData,
+      relatedParties,
+      webhookUrl,
+      status: 'pending'
+    });
+
+    const paymentUrl = await CMIService.getPaymentUrl(encryptedData);
+
+    res.json({ success: true, paymentUrl, transactionId: transaction._id });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, message: 'Payment initiation failed.' });
   }
+};
 
-  static async callback(req, res) {
-    try {
-      const data = CMIService.verifyPaymentResponse(req.body);
+exports.callback = async (req, res) => {
+  try {
+    const { transactionId, status, data } = req.body;
 
-      // Update transaction
-      const transaction = await PaymentTransaction.findOne({ orderId: data.orderId });
-      transaction.status = data.success ? 'completed' : 'failed';
-      await transaction.save();
-
-      // Trigger hooks
-      if (data.success) {
-        await triggerSuccessHook(transaction);
-      } else {
-        await triggerFailHook(transaction);
-      }
-
-      res.sendStatus(200);
-    } catch (err) {
-      res.status(400).json({ success: false, message: err.message });
+    const transaction = await PaymentTransaction.findById(transactionId);
+    if (!transaction) {
+      return res.status(404).json({ success: false, message: 'Transaction not found.' });
     }
-  }
-}
 
-module.exports = PaymentController;
+    transaction.status = status === 'success' ? 'completed' : 'failed';
+    await transaction.save();
+
+    if (status === 'success') {
+      await triggerSuccessHook(transaction);
+    } else {
+      await triggerFailHook(transaction);
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, message: 'Callback processing failed.' });
+  }
+};
